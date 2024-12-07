@@ -10,3 +10,5 @@ pypdf
 openai
 pdfplumber
 python-docx
+botocore
+bsdiff4

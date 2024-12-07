@@ -21,7 +21,7 @@ def test_bucket_connection():
     print(objects)
 
 def ingest_docs():
-    file_key = "course.pdf"
+    file_key = "course.docx"
     local_path = f"/usr/local/airflow/include/{file_key}"
     s3_hook = S3Hook(aws_conn_id='minio_conn')
     try:
