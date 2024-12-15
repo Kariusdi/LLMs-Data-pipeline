@@ -1,0 +1,8 @@
+build-essential
+cmake
+libfreetype6-dev
+libharfbuzz-dev
+libopenjp2-7-dev
+libssl-dev
+make
+zlib1g-dev
