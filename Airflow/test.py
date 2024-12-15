@@ -1,38 +1,52 @@
-# -------------------- not Include layout but fast --------------------
-# import pdfplumber
-# from docx import Document
-# from docx.shared import Inches
+# import pymupdf4llm
 
-# # Open a PDF file
-# with pdfplumber.open("./include/test.pdf") as pdf:
+# md_text = pymupdf4llm.to_markdown("course.pdf")
 
-#     # Extract text from the PDF
-#     text = ""
-#     for page in pdf.pages:
-#         text += page.extract_text()
- 
-# # Create a new Word document
-# document = Document()
+# # now work with the markdown text, e.g. store as a UTF8-encoded file
+# import pathlib
+# pathlib.Path("output.md").write_bytes(md_text.encode())
 
-# # Add a paragraph in Word to hold the text
-# document.add_paragraph(text)
+import fitz  # PyMuPDF
+import pymupdf4llm
+import pathlib
 
-# # Save the Word document
-# document.save("output.docx")
+def extract_without_toc(pdf_path, toc_keywords=("สารบัญ", "Contents", "Table of Contents")):
+    pdf_document = fitz.open(pdf_path)
+    pages_to_exclude = []
+    extracted_text = []
 
+    for page_number in range(len(pdf_document)):
+        page = pdf_document[page_number]
+        text = page.get_text()
+        
+        # Check if the page is part of the TOC
+        if any(keyword in text for keyword in toc_keywords):
+            pages_to_exclude.append(page_number)
+        else:
+            extracted_text.append(text)
+    
+    pdf_document.close()
+    return extracted_text, pages_to_exclude
 
-# --------------------- Include layout but slow ----------------------
+def pdf_to_markdown_without_toc(pdf_path, output_md_path, toc_keywords=("สารบัญ", "Contents", "Table of Contents")):
+    # Step 1: Filter out TOC pages
+    pdf_document = fitz.open(pdf_path)
+    pages_to_include = []
+    for page_number in range(len(pdf_document)):
+        page = pdf_document[page_number]
+        text = page.get_text()
+        
+        # Check if this page is not part of the TOC
+        if not any(keyword in text for keyword in toc_keywords):
+            pages_to_include.append(page_number)
+    pdf_document.close()
 
-# from pdf2docx import Converter
+    # Step 2: Use PyMuPDF4LLM to convert non-TOC pages to Markdown
+    md_text = pymupdf4llm.to_markdown(pdf_path, pages=pages_to_include)
 
-# def convert_pdf_to_docx(pdf_file, docx_file):
+    # Step 3: Save as a UTF-8 Markdown file
+    pathlib.Path(output_md_path).write_bytes(md_text.encode())
+    print(f"Markdown file saved to {output_md_path}")
 
-#     # Create a Converter object
-#     cv = Converter(pdf_file)
-
-#     # Convert specified PDF page to docx 
-#     cv.convert(docx_file, start=0, end=None)
-#     cv.close()
-
-# # Convert a PDF to a Docx file
-# convert_pdf_to_docx("C:\\Users\\Administrator\\Desktop\\Input.pdf", "Output.docx")
+# Usage
+pdf_to_markdown_without_toc("course.pdf", "output.md")
