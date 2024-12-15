@@ -31,6 +31,7 @@ def extract_without_toc(pdf_path, toc_keywords=("สารบัญ", "Contents"
 def pdf_to_markdown_without_toc(pdf_path, output_md_path, toc_keywords=("สารบัญ", "Contents", "Table of Contents")):
     # Step 1: Filter out TOC pages
     pdf_document = fitz.open(pdf_path)
+    print(type(pdf_document))
     pages_to_include = []
     for page_number in range(len(pdf_document)):
         page = pdf_document[page_number]

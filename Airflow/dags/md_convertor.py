@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
 import pathlib
 from airflow import DAG
+from airflow.datasets import Dataset
 from airflow.models import Variable
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.utils.trigger_rule import TriggerRule
@@ -31,8 +32,8 @@ LOCAL_PATH_MD_ORIGINAL = BASE_LOCAL_PATH + "course.md"
 LOCAL_PATH_DELTA = BASE_LOCAL_PATH + "delta.bsdiff"
 BUCKET_FOLDER = "/cpe/"
 FILE_KEY_RAW = "course.pdf"
-FILE_KEY_TRANSFORMED = "course.md"
-BASELINE_KEY = BUCKET_FOLDER + "course.docx"
+FILE_KEY_TRANSFORMED = BUCKET_FOLDER + "course.md"
+BASELINE_KEY = BUCKET_FOLDER + "course.md"
 DELTA_KEY = BUCKET_FOLDER + "delta.bsdiff"
 
 # Bucket Connections
@@ -93,9 +94,8 @@ def set_starter_page(pdf_path):
 def pdf_to_markdown(pdf_path, output_md_path, start_page=0):
     pdf_document = fitz.open(pdf_path)
     pages_to_include = []
-    print("----->>>>>> ",pdf_document)
 
-    for page_number in range(start_page, len(pdf_document)):
+    for page_number in range(int(start_page), len(pdf_document)):
         page = pdf_document[page_number]
         text = page.get_text()
         if text.strip():
@@ -114,7 +114,7 @@ def check_readable_file(pdf_path):
         if text.strip():
             pages_to_include.append(page_number)
     if not pages_to_include:
-        print("No pages with readable text were found.")
+        print("No pages with readable text were found. Using OCR")
         return "ocr"
     return "set_starter_page"
     
@@ -133,7 +133,7 @@ def clean_markdown_file(input_md_path, output_md_path):
     print(f"Cleaned Markdown file saved to {output_md_path}")
 
 def clean_markdown(md_text):
-    md_text = re.sub(r'\s*(\d+)\s*(?=\n)', '\n', md_text)
+    md_text = re.sub(r'(?<!พ\.ศ\.\s)\b\d+\b(?=\n)', '\n', md_text)
     md_text = re.sub(r'#### \s*(\d+)\s*(?=\n)', '\n', md_text)
     return md_text
 
@@ -152,11 +152,22 @@ def upload_file_to_bucket(fileKey: str, bucketName: str, uploadFile: str):
     )
     print(f"Baseline file {LOCAL_PATH_MD_ORIGINAL} uploaded successfully to {Variable.get('bucket_name_transformed')}/{fileKey}")
 
+def cleanup_local_file():
+    files_to_delete = [LOCAL_PATH_PDF, LOCAL_PATH_MD_ORIGINAL, LOCAL_PATH_MD_UPDATE, LOCAL_PATH_DELTA]
+    for file_path in files_to_delete:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        else:
+            print("The file does not exist. Skip removing...")
+
+
+dataset1 = Dataset('host.docker.internal:9000://cdti-policies/course.pdf')
 
 with DAG(
     dag_id='md_convertor',
     start_date=datetime(2024, 12, 12),
-    schedule_interval='@daily',
+    # schedule_interval='@daily',
+    schedule=[dataset1],
     catchup=False,
     default_args=default_args
 ) as dag:
@@ -179,7 +190,7 @@ with DAG(
     transformed_file_existance_sensor = S3KeySensor(
         task_id='sensor_transformed_file_existance',
         bucket_name=MINIO_BUCKET_NAME_TRANSFORMED,
-        bucket_key='course.md',
+        bucket_key='/cpe/course.md',
         aws_conn_id=S3_CONN_ID,
         mode='poke',
         poke_interval=3,
@@ -200,8 +211,9 @@ with DAG(
         trigger_rule=TriggerRule.ONE_SUCCESS,
     )
     
-    is_file_readable = PythonOperator(
-        task_id='check_readable_file',
+    
+    is_readable_file = BranchPythonOperator(
+        task_id='is_readable_file',
         python_callable=check_readable_file,
         op_kwargs={'pdf_path': LOCAL_PATH_PDF}
     )
@@ -226,7 +238,7 @@ with DAG(
     clean_md_file = PythonOperator(
         task_id='clean_markdown_file',
         python_callable=clean_markdown_file,
-        op_kwargs={'input_md_path': LOCAL_PATH_MD_ORIGINAL, 'output_md_path': LOCAL_PATH_MD_ORIGINAL}
+        op_kwargs={'input_md_path': LOCAL_PATH_MD_UPDATE, 'output_md_path': LOCAL_PATH_MD_UPDATE}
     )
     
     generate_delta_file = PythonOperator(
@@ -248,19 +260,25 @@ with DAG(
         trigger_rule=TriggerRule.ALL_SUCCESS
     )
     
+    cleanup_files = PythonOperator(
+        task_id='cleanup_local_file',
+        python_callable=cleanup_local_file,
+        trigger_rule=TriggerRule.ONE_SUCCESS
+    )
+    
     md_not_found = EmptyOperator(task_id="md_not_found", trigger_rule=TriggerRule.ALL_SKIPPED)
     
-    # Define the DAG flow
+    # ------------------------------ Define the DAG flow ------------------------------
     buckets_connection_checker >> raw_file_existance_sensor
     buckets_connection_checker >> transformed_file_existance_sensor
     
-    raw_file_existance_sensor >> ingest_raw_document >> is_file_readable
+    raw_file_existance_sensor >> ingest_raw_document >> is_readable_file
     transformed_file_existance_sensor >> ingest_transformed_document >> generate_delta_file >> upload_delta_file
     transformed_file_existance_sensor >> md_not_found >> upload_baseline_file
     
     
-    is_file_readable >> set_starter_page_number >> convert_pdf_to_markdown >> clean_md_file
-    is_file_readable >> ocr_operation
+    is_readable_file >> set_starter_page_number >> convert_pdf_to_markdown >> clean_md_file
+    is_readable_file >> ocr_operation
     
-    clean_md_file >> generate_delta_file >> upload_delta_file
-    clean_md_file >> upload_baseline_file
+    clean_md_file >> generate_delta_file >> upload_delta_file >> cleanup_files
+    clean_md_file >> upload_baseline_file >> cleanup_files
