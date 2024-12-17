@@ -13,6 +13,7 @@ import os
 import pymupdf4llm
 import bsdiff4
 import re
+from plugins.s3 import ingest_document, upload_file_to_bucket
 
 default_args = {
     'owner': 'Chonakan',
@@ -30,8 +31,8 @@ LOCAL_PATH_PDF = BASE_LOCAL_PATH + "course.pdf"
 LOCAL_PATH_MD_UPDATE = BASE_LOCAL_PATH + "course_update.md"
 LOCAL_PATH_MD_ORIGINAL = BASE_LOCAL_PATH + "course.md"
 LOCAL_PATH_DELTA = BASE_LOCAL_PATH + "delta.bsdiff"
-BUCKET_FOLDER = "/cpe/"
-FILE_KEY_RAW = "course.pdf"
+BUCKET_FOLDER = "/syllabus/"
+FILE_KEY_RAW = BUCKET_FOLDER + "course.pdf"
 FILE_KEY_TRANSFORMED = BUCKET_FOLDER + "course.md"
 BASELINE_KEY = BUCKET_FOLDER + "course.md"
 DELTA_KEY = BUCKET_FOLDER + "delta.bsdiff"
@@ -45,18 +46,6 @@ def check_buckets_connection():
     for bucket_name in bucket_list:
         s3_object = s3_hook.list_keys(bucket_name=bucket_name)
         print(f"Connected to the {bucket_name} in MinIO successfully...", s3_object)
-
-def ingest_document(file_key: str, bucketName: str, localPath: str):
-    try:
-        s3_object = s3_hook.get_key(key=file_key, bucket_name=bucketName)
-        if s3_object:
-            with open(localPath, "wb") as f:
-                s3_object.download_fileobj(f)
-            print(f"Downloaded {file_key} into local environment at {localPath}")
-        else:
-            print(f"File '{file_key}' not found in bucket '{bucketName}'.")
-    except Exception as e:
-        print(f"Error downloading file '{file_key}': {e}")
 
 def set_starter_page(pdf_path):
     pdf_document = fitz.open(pdf_path)
@@ -77,16 +66,12 @@ def set_starter_page(pdf_path):
 
         print(f"Page {page_number + 1}:")
         if footer_number:
-            # print(f"  Footer: {' | '.join(footer_number).strip()}")
             if int(footer_number[0]) == 1:
                 count_one += 1
             if count_one == 2:
                 print(f"Returning page {page_number} as starting point.")
                 pdf_document.close()
                 return page_number
-        # else:
-        #     print("  Footer: None")
-        # print("-" * 50)
 
     pdf_document.close()
     return 0
@@ -119,14 +104,11 @@ def check_readable_file(pdf_path):
     return "set_starter_page"
     
 def clean_markdown_file(input_md_path, output_md_path):
-    # Read the input Markdown file
     with open(input_md_path, 'r', encoding='utf-8') as f:
         md_text = f.read()
 
-    # Clean the Markdown content
     md_text = clean_markdown(md_text)
 
-    # Write the cleaned content to the output file
     with open(output_md_path, 'w', encoding='utf-8') as f:
         f.write(md_text)
 
@@ -143,15 +125,6 @@ def ocr():
 def generate_binary_delta(baseline_file: str, update_file: str, delta_file: str):
     bsdiff4.file_diff(baseline_file, update_file, delta_file)
 
-def upload_file_to_bucket(fileKey: str, bucketName: str, uploadFile: str):
-    s3_hook.load_file(
-        filename=uploadFile,
-        key=fileKey,
-        bucket_name=bucketName,
-        replace=True
-    )
-    print(f"Baseline file {LOCAL_PATH_MD_ORIGINAL} uploaded successfully to {Variable.get('bucket_name_transformed')}/{fileKey}")
-
 def cleanup_local_file():
     files_to_delete = [LOCAL_PATH_PDF, LOCAL_PATH_MD_ORIGINAL, LOCAL_PATH_MD_UPDATE, LOCAL_PATH_DELTA]
     for file_path in files_to_delete:
@@ -161,13 +134,13 @@ def cleanup_local_file():
             print("The file does not exist. Skip removing...")
 
 
-dataset1 = Dataset('host.docker.internal:9000://cdti-policies/course.pdf')
+dataset1 = Dataset('host.docker.internal:9000://cdti-policies/')
 
 with DAG(
     dag_id='md_convertor',
     start_date=datetime(2024, 12, 12),
     # schedule_interval='@daily',
-    schedule=[dataset1],
+    schedule=None,
     catchup=False,
     default_args=default_args
 ) as dag:
@@ -207,7 +180,10 @@ with DAG(
     ingest_transformed_document = PythonOperator(
         task_id='ingest_transformed_document',
         python_callable=ingest_document,
-        op_kwargs={'file_key': FILE_KEY_TRANSFORMED, 'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 'localPath': LOCAL_PATH_MD_ORIGINAL},
+        op_kwargs={'file_key': FILE_KEY_TRANSFORMED, 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'localPath': LOCAL_PATH_MD_ORIGINAL, 
+                   's3_hook': s3_hook},
         trigger_rule=TriggerRule.ONE_SUCCESS,
     )
     
@@ -249,14 +225,20 @@ with DAG(
     upload_delta_file = PythonOperator(
         task_id='upload_delta_to_bucket',
         python_callable=upload_file_to_bucket,
-        op_kwargs={'fileKey': DELTA_KEY, 'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 'uploadFile': LOCAL_PATH_DELTA},
+        op_kwargs={'fileKey': DELTA_KEY, 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'uploadFile': LOCAL_PATH_DELTA,
+                   's3_hook': s3_hook},
         trigger_rule=TriggerRule.ALL_SUCCESS
     )
 
     upload_baseline_file = PythonOperator(
         task_id='upload_baseline_to_bucket',
         python_callable=upload_file_to_bucket,
-        op_kwargs={'fileKey': BASELINE_KEY, 'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 'uploadFile': LOCAL_PATH_MD_UPDATE},
+        op_kwargs={'fileKey': BASELINE_KEY, 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'uploadFile': LOCAL_PATH_MD_UPDATE,
+                   's3_hook': s3_hook},
         trigger_rule=TriggerRule.ALL_SUCCESS
     )
     
