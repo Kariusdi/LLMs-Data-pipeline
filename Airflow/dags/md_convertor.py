@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta
+import glob
 import pathlib
 from airflow import DAG
 from airflow.datasets import Dataset
+from airflow.utils.task_group import TaskGroup
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
@@ -15,7 +17,8 @@ import bsdiff4
 import re
 import json
 from plugins.model.convertor import Config
-from plugins.s3 import ingest_document
+from plugins.s3 import ingest_document, upload_file_to_bucket
+
 
 default_args = {
     'owner': 'Chonakan',
@@ -50,13 +53,15 @@ def receive_files_path():
 def variables_setting(filePaths, ti=None):
     filePath = json.loads(filePaths)
     folder_name = filePath[0].split('/')[0] + '/'
+    file_names = [os.path.basename(path) for path in filePath]
+    print(file_names)
     
     updated_values = {
-        "LOCAL_PATH_PDF": config.BASE_LOCAL_PATH + filePath[0],
-        "LOCAL_PATH_MD_ORIGINAL": config.BASE_LOCAL_PATH + folder_name + "baseline.md",
-        "LOCAL_PATH_MD_UPDATE": config.BASE_LOCAL_PATH + folder_name + "update.md",
+        "LOCAL_PATH_PDF": config.BASE_LOCAL_PATH + file_names[0],
+        "LOCAL_PATH_MD_ORIGINAL": config.BASE_LOCAL_PATH + "baseline.md",
+        "LOCAL_PATH_MD_UPDATE": config.BASE_LOCAL_PATH + "update.md",
         "FILE_KEY_RAW": '/' + filePath[0],
-        "BASELINE_KEY": '/' + folder_name + 'course.md',
+        "BASELINE_KEY": '/' + folder_name + 'baseline.md',
         "DELTA_KEY": '/' + folder_name + 'delta.bsdiff'
     }
     ti.xcom_push(key="updated_config_values", value=updated_values)
@@ -114,7 +119,7 @@ def check_readable_file(pdf_path):
             pages_to_include.append(page_number)
     if not pages_to_include:
         print("No pages with readable text were found. Using OCR")
-        return "ocr"
+        return "ocr_operation"
     return "set_starter_page"
     
 def clean_markdown_file(input_md_path, output_md_path):
@@ -139,13 +144,19 @@ def ocr():
 def generate_binary_delta(baseline_file: str, update_file: str, delta_file: str):
     bsdiff4.file_diff(baseline_file, update_file, delta_file)
 
-def cleanup_local_file():
-    files_to_delete = [LOCAL_PATH_PDF, LOCAL_PATH_MD_ORIGINAL, LOCAL_PATH_MD_UPDATE, LOCAL_PATH_DELTA]
-    for file_path in files_to_delete:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        else:
-            print("The file does not exist. Skip removing...")
+def cleanup_local_files():
+    INCLUDES_DIR = "/usr/local/airflow/include/" 
+    if os.path.exists(INCLUDES_DIR) and os.path.isdir(INCLUDES_DIR):
+        files_to_delete = glob.glob(os.path.join(INCLUDES_DIR, "*"))  # Get all files in the directory
+        for file_path in files_to_delete:
+            try:
+                os.remove(file_path)
+                print(f"Deleted file: {file_path}")
+            except Exception as e:
+                print(f"Failed to delete file {file_path}: {e}")
+    else:
+        print(f"The directory {INCLUDES_DIR} does not exist. Skipping cleanup...")
+
 
 
 dataset1 = Dataset('host.docker.internal:9000://cdti-policies/')
@@ -153,148 +164,163 @@ dataset1 = Dataset('host.docker.internal:9000://cdti-policies/')
 with DAG(
     dag_id='md_convertor',
     start_date=datetime(2024, 12, 12),
-    # schedule_interval='@daily',
     schedule=None,
     catchup=False,
     default_args=default_args
 ) as dag:
     
-    # buckets_connection_checker = PythonOperator(
-    #     task_id='check_bucket_connection',
-    #     python_callable=check_buckets_connection
-    # )
+    receive_files = PythonOperator(
+        task_id='receive_files_path',
+        python_callable=receive_files_path,
+        provide_context=True,
+    )
     
-    # raw_file_existance_sensor = S3KeySensor(
-    #     task_id='sensor_raw_file_existance',
-    #     bucket_name=MINIO_BUCKET_NAME_RAW,
-    #     bucket_key='course.pdf',
-    #     aws_conn_id=S3_CONN_ID,
-    #     mode='poke',
-    #     poke_interval=3,
-    #     timeout=15
-    # )
+    vers_setting = PythonOperator(
+        task_id='variables_setting',
+        python_callable=variables_setting,
+        provide_context=True,
+        op_kwargs={"filePaths": "{{ ti.xcom_pull(task_ids='receive_files_path') }}"}
+    )
     
-    # transformed_file_existance_sensor = S3KeySensor(
-    #     task_id='sensor_transformed_file_existance',
-    #     bucket_name=MINIO_BUCKET_NAME_TRANSFORMED,
-    #     bucket_key='/cpe/course.md',
-    #     aws_conn_id=S3_CONN_ID,
-    #     mode='poke',
-    #     poke_interval=3,
-    #     timeout=15,
-    #     soft_fail=True,
-    # )
+    transformed_file_existance_sensor = S3KeySensor(
+        task_id='sensor_transformed_file_existance',
+        bucket_name=MINIO_BUCKET_NAME_TRANSFORMED,
+        bucket_key="{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['BASELINE_KEY'] }}",
+        aws_conn_id=S3_CONN_ID,
+        mode='poke',
+        poke_interval=3,
+        timeout=15,
+        soft_fail=True,
+    )
     
+    ingest_raw_document = PythonOperator(
+        task_id='ingest_raw_document',
+        python_callable=ingest_document,
+        op_kwargs={'file_key': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['FILE_KEY_RAW'] }}", 
+                   'localPath': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_PDF'] }}",
+                   'bucketName': MINIO_BUCKET_NAME_RAW, 
+                   "s3_hook": s3_hook}
+    )
     
+    ingest_transformed_document = PythonOperator(
+        task_id='ingest_transformed_document',
+        python_callable=ingest_document,
+        op_kwargs={'file_key': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['BASELINE_KEY'] }}", 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'localPath': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_ORIGINAL'] }}", 
+                   's3_hook': s3_hook},
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
     
-    # ingest_transformed_document = PythonOperator(
-    #     task_id='ingest_transformed_document',
-    #     python_callable=ingest_document,
-    #     op_kwargs={'file_key': FILE_KEY_TRANSFORMED, 
-    #                'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
-    #                'localPath': LOCAL_PATH_MD_ORIGINAL, 
-    #                's3_hook': s3_hook},
-    #     trigger_rule=TriggerRule.ONE_SUCCESS,
-    # )
+    is_readable_file = BranchPythonOperator(
+        task_id='is_readable_file',
+        python_callable=check_readable_file,
+        op_kwargs={'pdf_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_PDF'] }}"}
+    )
     
+    set_starter_page_number = PythonOperator(
+        task_id='set_starter_page',
+        python_callable=set_starter_page,
+        op_kwargs={'pdf_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_PDF'] }}"}
+    )
     
-    # is_readable_file = BranchPythonOperator(
-    #     task_id='is_readable_file',
-    #     python_callable=check_readable_file,
-    #     op_kwargs={'pdf_path': LOCAL_PATH_PDF}
-    # )
+    convert_pdf_to_markdown = PythonOperator(
+        task_id='pdf_to_markdown',
+        python_callable=pdf_to_markdown,
+        op_kwargs={'pdf_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_PDF'] }}",
+                   'output_md_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_UPDATE'] }}", 
+                   'start_page': "{{ ti.xcom_pull(task_ids='set_starter_page') }}"}
+    )
     
-    # set_starter_page_number = PythonOperator(
-    #     task_id='set_starter_page',
-    #     python_callable=set_starter_page,
-    #     op_kwargs={'pdf_path': LOCAL_PATH_PDF}
-    # )
+    ocr_operation = PythonOperator(
+        task_id='ocr_operation',
+        python_callable=ocr
+    )
     
-    # convert_pdf_to_markdown = PythonOperator(
-    #     task_id='pdf_to_markdown',
-    #     python_callable=pdf_to_markdown,
-    #     op_kwargs={'pdf_path': LOCAL_PATH_PDF, 'output_md_path': LOCAL_PATH_MD_UPDATE, 'start_page': "{{ ti.xcom_pull(task_ids='set_starter_page') }}"}
-    # )
+    clean_md_file = PythonOperator(
+        task_id='clean_markdown_file',
+        python_callable=clean_markdown_file,
+        op_kwargs={'input_md_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_UPDATE'] }}",
+                   'output_md_path': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_UPDATE'] }}"}
+    )
     
-    # ocr_operation = PythonOperator(
-    #     task_id='ocr_operation',
-    #     python_callable=ocr
-    # )
+    generate_delta_file = PythonOperator(
+        task_id='generate_delta_file',
+        python_callable=generate_binary_delta,
+        op_kwargs={'baseline_file': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_ORIGINAL'] }}", 
+                   'update_file': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_UPDATE'] }}", 
+                   'delta_file': config.LOCAL_PATH_DELTA}
+    )
     
-    # clean_md_file = PythonOperator(
-    #     task_id='clean_markdown_file',
-    #     python_callable=clean_markdown_file,
-    #     op_kwargs={'input_md_path': LOCAL_PATH_MD_UPDATE, 'output_md_path': LOCAL_PATH_MD_UPDATE}
-    # )
-    
-    # generate_delta_file = PythonOperator(
-    #     task_id='generate_delta_file',
-    #     python_callable=generate_binary_delta,
-    #     op_kwargs={'baseline_file': LOCAL_PATH_MD_ORIGINAL, 'update_file': LOCAL_PATH_MD_UPDATE, 'delta_file': LOCAL_PATH_DELTA}
-    # )
-    # upload_delta_file = PythonOperator(
-    #     task_id='upload_delta_to_bucket',
-    #     python_callable=upload_file_to_bucket,
-    #     op_kwargs={'fileKey': DELTA_KEY, 
-    #                'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
-    #                'uploadFile': LOCAL_PATH_DELTA,
-    #                's3_hook': s3_hook},
-    #     trigger_rule=TriggerRule.ALL_SUCCESS
-    # )
+    upload_delta_file = PythonOperator(
+        task_id='upload_delta_to_bucket',
+        python_callable=upload_file_to_bucket,
+        op_kwargs={'fileKey': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['DELTA_KEY'] }}", 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'uploadFile': config.LOCAL_PATH_DELTA,
+                   's3_hook': s3_hook},
+        trigger_rule=TriggerRule.ALL_SUCCESS
+    )
 
-    # upload_baseline_file = PythonOperator(
-    #     task_id='upload_baseline_to_bucket',
-    #     python_callable=upload_file_to_bucket,
-    #     op_kwargs={'fileKey': BASELINE_KEY, 
-    #                'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
-    #                'uploadFile': LOCAL_PATH_MD_UPDATE,
-    #                's3_hook': s3_hook},
-    #     trigger_rule=TriggerRule.ALL_SUCCESS
-    # )
+    upload_baseline_file = PythonOperator(
+        task_id='upload_baseline_to_bucket',
+        python_callable=upload_file_to_bucket,
+        op_kwargs={'fileKey': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['BASELINE_KEY'] }}", 
+                   'bucketName': MINIO_BUCKET_NAME_TRANSFORMED, 
+                   'uploadFile': "{{ task_instance.xcom_pull(task_ids='variables_setting', key='updated_config_values')['LOCAL_PATH_MD_UPDATE'] }}",
+                   's3_hook': s3_hook},
+        trigger_rule=TriggerRule.ALL_SUCCESS
+    )
     
-    # cleanup_files = PythonOperator(
-    #     task_id='cleanup_local_file',
-    #     python_callable=cleanup_local_file,
-    #     trigger_rule=TriggerRule.ONE_SUCCESS
-    # )
+    cleanup_files = PythonOperator(
+        task_id='cleanup_local_file',
+        python_callable=cleanup_local_files,
+        trigger_rule=TriggerRule.ONE_SUCCESS
+    )
     
-    # md_not_found = EmptyOperator(task_id="md_not_found", trigger_rule=TriggerRule.ALL_SKIPPED)
+    md_not_found = EmptyOperator(task_id="md_not_found", trigger_rule=TriggerRule.ALL_SKIPPED)
     
     # # ------------------------------ Define the DAG flow ------------------------------
     # buckets_connection_checker >> raw_file_existance_sensor
     # buckets_connection_checker >> transformed_file_existance_sensor
     
     # raw_file_existance_sensor >> ingest_raw_document >> is_readable_file
-    # transformed_file_existance_sensor >> ingest_transformed_document >> generate_delta_file >> upload_delta_file
-    # transformed_file_existance_sensor >> md_not_found >> upload_baseline_file
-    
-    
-    # is_readable_file >> set_starter_page_number >> convert_pdf_to_markdown >> clean_md_file
-    # is_readable_file >> ocr_operation
-    
-    # clean_md_file >> generate_delta_file >> upload_delta_file >> cleanup_files
-    # clean_md_file >> upload_baseline_file >> cleanup_files
 
-    task1_child = PythonOperator(
-        task_id='task1_child',
-        python_callable=receive_files_path,
-        provide_context=True,
-    )
+    receive_files >> vers_setting
+    vers_setting >> ingest_raw_document >> is_readable_file
+    vers_setting >> transformed_file_existance_sensor
     
-    task2_child = PythonOperator(
-        task_id='task2_child',
-        python_callable=variables_setting,
-        provide_context=True,
-        op_kwargs={"filePaths": "{{ ti.xcom_pull(task_ids='task1_child') }}"}
-    )
+    is_readable_file >> set_starter_page_number >> convert_pdf_to_markdown >> clean_md_file
+    is_readable_file >> ocr_operation
     
-    ingest_raw_document = PythonOperator(
-        task_id='ingest_raw_document',
-        python_callable=ingest_document,
-        op_kwargs={'bucketName': MINIO_BUCKET_NAME_RAW, "s3_hook": s3_hook}
-    )
-    
-    task1_child >> task2_child >> ingest_raw_document
+    transformed_file_existance_sensor >> md_not_found >> upload_baseline_file
+    transformed_file_existance_sensor >> ingest_transformed_document >> generate_delta_file >> upload_delta_file
         
-    # task2_child = DummyOperator(task_id="task2_child")
-    # task3_child = DummyOperator(task_id="task3_child")
+    clean_md_file >> upload_baseline_file >> cleanup_files
+    clean_md_file >> generate_delta_file >> upload_delta_file >> cleanup_files
+
+# buckets_connection_checker = PythonOperator(
+#     task_id='check_bucket_connection',
+#     python_callable=check_buckets_connection
+# )
+
+# raw_file_existance_sensor = S3KeySensor(
+#     task_id='sensor_raw_file_existance',
+#     bucket_name=MINIO_BUCKET_NAME_RAW,
+#     bucket_key='course.pdf',
+#     aws_conn_id=S3_CONN_ID,
+#     mode='poke',
+#     poke_interval=3,
+#     timeout=15
+# )
+
+# transformed_file_existance_sensor = S3KeySensor(
+#     task_id='sensor_transformed_file_existance',
+#     bucket_name=MINIO_BUCKET_NAME_TRANSFORMED,
+#     bucket_key='/cpe/course.md',
+#     aws_conn_id=S3_CONN_ID,
+#     mode='poke',
+#     poke_interval=3,
+#     timeout=15,
+#     soft_fail=True,
+# )
