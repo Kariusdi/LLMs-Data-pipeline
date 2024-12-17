@@ -14,6 +14,8 @@ import pymupdf4llm
 import bsdiff4
 import re
 import json
+from plugins.model.convertor import Config
+from plugins.s3 import ingest_document
 
 default_args = {
     'owner': 'Chonakan',
@@ -25,17 +27,7 @@ default_args = {
 MINIO_BUCKET_NAME_RAW = Variable.get("bucket_name_raw")
 MINIO_BUCKET_NAME_TRANSFORMED = Variable.get("bucket_name_transformed")
 
-# Handling Files path
-BASE_LOCAL_PATH = "/usr/local/airflow/include/"
-LOCAL_PATH_PDF = BASE_LOCAL_PATH + "course.pdf"
-LOCAL_PATH_MD_UPDATE = BASE_LOCAL_PATH + "course_update.md"
-LOCAL_PATH_MD_ORIGINAL = BASE_LOCAL_PATH + "course.md"
-LOCAL_PATH_DELTA = BASE_LOCAL_PATH + "delta.bsdiff"
-BUCKET_FOLDER = "/syllabus/"
-FILE_KEY_RAW = BUCKET_FOLDER + "course.pdf"
-FILE_KEY_TRANSFORMED = BUCKET_FOLDER + "course.md"
-BASELINE_KEY = BUCKET_FOLDER + "course.md"
-DELTA_KEY = BUCKET_FOLDER + "delta.bsdiff"
+config = Config()
 
 # Bucket Connections
 S3_CONN_ID = "minio_conn"
@@ -48,12 +40,26 @@ def receive_files_path():
     if raw_value.startswith("[") and raw_value.endswith("]"):
         fixed_value = raw_value.replace("'", '"')
         try:
-            return json.loads(fixed_value)
+            return fixed_value
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON: {e}")
             return []
     else:
         return raw_value
+    
+def variables_setting(filePaths, ti=None):
+    filePath = json.loads(filePaths)
+    folder_name = filePath[0].split('/')[0] + '/'
+    
+    updated_values = {
+        "LOCAL_PATH_PDF": config.BASE_LOCAL_PATH + filePath[0],
+        "LOCAL_PATH_MD_ORIGINAL": config.BASE_LOCAL_PATH + folder_name + "baseline.md",
+        "LOCAL_PATH_MD_UPDATE": config.BASE_LOCAL_PATH + folder_name + "update.md",
+        "FILE_KEY_RAW": '/' + filePath[0],
+        "BASELINE_KEY": '/' + folder_name + 'course.md',
+        "DELTA_KEY": '/' + folder_name + 'delta.bsdiff'
+    }
+    ti.xcom_push(key="updated_config_values", value=updated_values)
 
 def set_starter_page(pdf_path):
     pdf_document = fitz.open(pdf_path)
@@ -179,11 +185,7 @@ with DAG(
     #     soft_fail=True,
     # )
     
-    # ingest_raw_document = PythonOperator(
-    #     task_id='ingest_raw_document',
-    #     python_callable=ingest_document,
-    #     op_kwargs={'file_key': FILE_KEY_RAW, 'bucketName': MINIO_BUCKET_NAME_RAW, 'localPath': LOCAL_PATH_PDF}
-    # )
+    
     
     # ingest_transformed_document = PythonOperator(
     #     task_id='ingest_transformed_document',
@@ -279,7 +281,20 @@ with DAG(
         provide_context=True,
     )
     
-    task1_child
+    task2_child = PythonOperator(
+        task_id='task2_child',
+        python_callable=variables_setting,
+        provide_context=True,
+        op_kwargs={"filePaths": "{{ ti.xcom_pull(task_ids='task1_child') }}"}
+    )
+    
+    ingest_raw_document = PythonOperator(
+        task_id='ingest_raw_document',
+        python_callable=ingest_document,
+        op_kwargs={'bucketName': MINIO_BUCKET_NAME_RAW, "s3_hook": s3_hook}
+    )
+    
+    task1_child >> task2_child >> ingest_raw_document
         
     # task2_child = DummyOperator(task_id="task2_child")
     # task3_child = DummyOperator(task_id="task3_child")

@@ -1,11 +1,13 @@
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.models import Variable
 from airflow import DAG
 from datetime import datetime, timedelta
 from plugins.s3 import check_buckets_connection
 import json
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.operators.empty import EmptyOperator
 
 default_args = {
     'owner': 'Chonakan',
@@ -24,11 +26,11 @@ def list_minio_files(bucket_name, prefix=None, ti=None):
 
     if keys:
         print(f"Files in cdti-policies bucket /{prefix}: '{bucket_name}': {keys}")
+        Variable.set("bucket_files", json.dumps(keys))
+        return "trigger_convertor"
     else:
         print(f"No files found in bucket '{bucket_name}' with prefix '{prefix}'.")
-    
-    print(type(keys))
-    Variable.set("bucket_files", json.dumps(keys))
+        return "keys_not_found"
 
 with DAG(
     default_args=default_args,
@@ -42,8 +44,8 @@ with DAG(
         python_callable=check_buckets_connection,
         op_kwargs={'bucket_list': BUCKET_LIST, 's3_hook': s3_hook}
     )
-
-    list_files_task = PythonOperator(
+    
+    list_files_task = BranchPythonOperator(
         task_id='syllabus_files_in_minio_bucket',
         python_callable=list_minio_files,
         op_kwargs={
@@ -52,13 +54,19 @@ with DAG(
         },
         provide_context=True
     )
+    
+    keys_not_found = EmptyOperator(task_id="keys_not_found")
 
     trigger_convertor = TriggerDagRunOperator(
         task_id="trigger_convertor",
         trigger_dag_id="md_convertor",
     )
     
-    buckets_connection_checker >> list_files_task >> trigger_convertor
+    # Define Dag flow
+    buckets_connection_checker >> list_files_task
+    
+    list_files_task >> keys_not_found
+    list_files_task >> trigger_convertor
     
 with DAG(
     default_args=default_args,
@@ -74,8 +82,8 @@ with DAG(
         op_kwargs={'bucket_list': BUCKET_LIST, 's3_hook': s3_hook}
     )
 
-    list_files_task = PythonOperator(
-        task_id='guide_files_in_minio_bucket',
+    list_files_task = BranchPythonOperator(
+        task_id='syllabus_files_in_minio_bucket',
         python_callable=list_minio_files,
         op_kwargs={
             'bucket_name': MINIO_BUCKET_NAME_RAW,
@@ -83,13 +91,19 @@ with DAG(
         },
         provide_context=True
     )
+    
+    keys_not_found = EmptyOperator(task_id="keys_not_found")
 
     trigger_convertor = TriggerDagRunOperator(
         task_id="trigger_convertor",
         trigger_dag_id="md_convertor",
     )
     
-    buckets_connection_checker >> list_files_task >> trigger_convertor
+    # Define Dag flow
+    buckets_connection_checker >> list_files_task
+    
+    list_files_task >> keys_not_found
+    list_files_task >> trigger_convertor
 
 with DAG(
     default_args=default_args,
@@ -105,8 +119,8 @@ with DAG(
         op_kwargs={'bucket_list': BUCKET_LIST, 's3_hook': s3_hook}
     )
 
-    list_files_task = PythonOperator(
-        task_id='rule_files_in_minio_bucket',
+    list_files_task = BranchPythonOperator(
+        task_id='syllabus_files_in_minio_bucket',
         python_callable=list_minio_files,
         op_kwargs={
             'bucket_name': MINIO_BUCKET_NAME_RAW,
@@ -114,10 +128,16 @@ with DAG(
         },
         provide_context=True
     )
+    
+    keys_not_found = EmptyOperator(task_id="keys_not_found")
 
     trigger_convertor = TriggerDagRunOperator(
         task_id="trigger_convertor",
         trigger_dag_id="md_convertor",
     )
     
-    buckets_connection_checker >> list_files_task >> trigger_convertor
+    # Define Dag flow
+    buckets_connection_checker >> list_files_task
+    
+    list_files_task >> keys_not_found
+    list_files_task >> trigger_convertor

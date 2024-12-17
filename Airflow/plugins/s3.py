@@ -5,7 +5,12 @@ def check_buckets_connection(bucket_list, s3_hook):
         print(f"Connected to the {bucket_name} in MinIO successfully...", s3_object)
 
 # Ingest Document from Bucket    
-def ingest_document(file_key: str, bucketName: str, localPath: str, s3_hook):
+def ingest_document(bucketName: str, s3_hook, ti=None):
+    updated_values = ti.xcom_pull(task_ids='task2_child', key='updated_config_values')
+    
+    # Use updated values
+    file_key = updated_values["FILE_KEY_RAW"]
+    localPath = updated_values["LOCAL_PATH_PDF"]
     try:
         s3_object = s3_hook.get_key(key=file_key, bucket_name=bucketName)
         if s3_object:
